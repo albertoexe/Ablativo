@@ -1,0 +1,21 @@
+# Rust
+target/
+
+# Node
+node_modules/
+dist/
+
+# Tauri generated
+src-tauri/gen/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.local
+ablativo-tauri/

@@ -1,0 +1,4 @@
+# Build environment — required for whisper-rs (compiles whisper.cpp via cmake)
+[env]
+LIBCLANG_PATH = "C:\\Program Files\\LLVM\\bin"
+CMAKE         = "C:\\Program Files (x86)\\Microsoft Visual Studio\\18\\BuildTools\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\CMake\\bin\\cmake.exe"

@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ablativo Settings</title>
+  <link rel="stylesheet" href="settings.css" />
+</head>
+<body>
+  <div class="window">
+
+    <div class="titlebar">
+      <span class="app-name">Ablativo</span>
+      <span class="version">Settings</span>
+    </div>
+
+    <!-- ── Hotkey ─────────────────────────────────────────── -->
+    <section class="section">
+      <div class="section-label">HOTKEY</div>
+      <div class="hotkey-row">
+        <div id="hotkeyDisplay" class="hotkey-badge" title="Click to change">
+          Ctrl + Space
+        </div>
+        <span class="hint" id="hotkeyHint">click to reconfigure</span>
+      </div>
+    </section>
+
+    <div class="divider"></div>
+
+    <!-- ── Model ──────────────────────────────────────────── -->
+    <section class="section">
+      <div class="section-label">MODEL</div>
+      <select id="modelSelect" class="select">
+        <option value="">Loading…</option>
+      </select>
+    </section>
+
+    <div class="divider"></div>
+
+    <!-- ── History ────────────────────────────────────────── -->
+    <section class="section">
+      <div class="section-label">HISTORY</div>
+      <ul id="historyList" class="history-list">
+        <li class="history-empty">No transcriptions yet.</li>
+      </ul>
+    </section>
+
+    <div class="footer">
+      <button id="saveBtn" class="btn-primary">Save</button>
+    </div>
+
+  </div>
+
+  <script type="module" src="settings.js"></script>
+</body>
+</html>

@@ -1,0 +1,114 @@
+/* ── Reset & transparent shell ────────────────────────────────────────────── */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  -webkit-app-region: drag;
+  user-select: none;
+}
+
+/* ── Pill container ───────────────────────────────────────────────────────── */
+
+#pill {
+  position: fixed;
+  bottom: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  margin-bottom: 6px;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  background: rgba(22, 22, 24, 0.92);
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  border-radius: 999px;
+
+  padding: 0 20px;
+  height: 48px;
+  min-width: 120px;
+
+  -webkit-app-region: no-drag;
+}
+
+/* ── State visibility ─────────────────────────────────────────────────────── */
+
+.rec-content { display: flex; align-items: center; gap: 10px; }
+.tx-content  { display: none;  align-items: center; justify-content: center; }
+
+#pill.transcribing .rec-content { display: none; }
+#pill.transcribing .tx-content  { display: flex; }
+
+/* ── Red pulsing dot ──────────────────────────────────────────────────────── */
+
+.dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #ff3b30;
+  box-shadow: 0 0 0 0 rgba(255, 59, 48, 0.5);
+  animation: pulse 1.6s ease-in-out infinite;
+  flex-shrink: 0;
+}
+
+@keyframes pulse {
+  0%   { box-shadow: 0 0 0 0   rgba(255, 59, 48, 0.5); }
+  60%  { box-shadow: 0 0 0 7px rgba(255, 59, 48, 0);   }
+  100% { box-shadow: 0 0 0 0   rgba(255, 59, 48, 0);   }
+}
+
+/* ── Waveform bars (driven entirely by JS — no CSS animation) ─────────────── */
+
+.waveform {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  height: 24px;
+}
+
+.waveform span {
+  display: block;
+  width: 3px;
+  height: 4px;           /* default = silent; JS raises this on voice input  */
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.80);
+  transition: height 0.05s ease-out; /* smooth micro-transitions between frames */
+}
+
+/* ── Transcribing dots ────────────────────────────────────────────────────── */
+
+.tx-dots {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.tx-dots span {
+  display: block;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.85);
+  animation: dot-glow 1.2s ease-in-out infinite;
+}
+
+.tx-dots span:nth-child(1) { animation-delay: 0.00s; }
+.tx-dots span:nth-child(2) { animation-delay: 0.20s; }
+.tx-dots span:nth-child(3) { animation-delay: 0.40s; }
+
+@keyframes dot-glow {
+  0%, 100% { opacity: 0.25; transform: scale(0.8);  }
+  50%       { opacity: 1;    transform: scale(1.25); }
+}
