@@ -9,32 +9,157 @@ use tauri::{
     AppHandle, Emitter, Manager, State,
 };
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use transcribe_rs::onnx::parakeet::{ParakeetModel, ParakeetParams, TimestampGranularity};
+use transcribe_rs::onnx::Quantization;
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+const MODEL_URL: &str = "https://blob.handy.computer/parakeet-v3-int8.tar.gz";
+const MODEL_DIR_NAME: &str = "parakeet-tdt-0.6b-v3-int8";
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct Settings {
     hotkey: String,
-    model: String,
-    language: String,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             hotkey: "Ctrl+Space".into(),
-            model: "ggml-base.en.bin".into(),
-            language: "en".into(),
         }
     }
 }
 
 // ── Managed state ─────────────────────────────────────────────────────────────
 
-struct WhisperBin(Mutex<Option<PathBuf>>);
-struct ModelPath(Mutex<Option<PathBuf>>);
+struct ParakeetEngine(Mutex<Option<ParakeetModel>>);
 struct History(Mutex<VecDeque<String>>);
 struct AppSettings(Mutex<Settings>);
+
+// ── Model helpers ─────────────────────────────────────────────────────────────
+
+fn model_dir(app: &AppHandle) -> Option<PathBuf> {
+    app.path()
+        .app_data_dir()
+        .ok()
+        .map(|d| d.join("models").join(MODEL_DIR_NAME))
+}
+
+/// Load Parakeet from disk into state. Call from a background thread.
+fn try_load_model(app: &AppHandle) {
+    if let Some(path) = model_dir(app) {
+        if path.exists() {
+            eprintln!("[ablativo] loading Parakeet V3 from {:?}", path);
+            match ParakeetModel::load(&path, &Quantization::Int8) {
+                Ok(model) => {
+                    *app.state::<ParakeetEngine>().0.lock().unwrap() = Some(model);
+                    eprintln!("[ablativo] Parakeet V3 ready ✓");
+                    let _ = app.emit("model-ready", ());
+                }
+                Err(e) => {
+                    eprintln!("[ablativo] model load failed: {}", e);
+                    let _ = app.emit("model-status", "error");
+                }
+            }
+        } else {
+            eprintln!("[ablativo] model not found at {:?}", path);
+            let _ = app.emit("model-status", "not-found");
+        }
+    }
+}
+
+// ── Model commands ────────────────────────────────────────────────────────────
+
+/// Returns true if the Parakeet model directory exists on disk.
+#[tauri::command]
+fn check_model(app: AppHandle) -> bool {
+    model_dir(&app).map(|p| p.exists()).unwrap_or(false)
+}
+
+/// Download + extract Parakeet V3 from Handy's blob storage.
+/// Runs in a background thread; emits model-status events to the frontend.
+#[tauri::command]
+fn download_model(app: AppHandle) -> Result<(), String> {
+    let models_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("models");
+
+    std::fs::create_dir_all(&models_dir).map_err(|e| e.to_string())?;
+
+    std::thread::spawn(move || {
+        eprintln!("[ablativo] downloading Parakeet V3 (~456 MB)...");
+        let _ = app.emit("model-status", "downloading");
+
+        // Download to temp file via curl.exe (built into Windows 10+, no timeout, shows progress)
+        let tar_path = std::env::temp_dir().join("parakeet-v3-int8.tar.gz");
+
+        let dl = std::process::Command::new("curl")
+            .args([
+                "--location",           // follow redirects
+                "--progress-bar",       // show download progress in terminal
+                "--retry", "99",        // keep retrying until done
+                "--retry-delay", "5",   // wait 5s between retries
+                "--retry-all-errors",   // retry on ALL errors including connection resets
+                "--output", tar_path.to_str().unwrap_or(""),
+                MODEL_URL,
+            ])
+            .status();
+
+        match dl {
+            Ok(s) if s.success() => {}
+            Ok(s) => {
+                eprintln!("[ablativo] curl failed, exit code: {:?}", s.code());
+                let _ = app.emit("model-status", "error");
+                return;
+            }
+            Err(e) => {
+                eprintln!("[ablativo] curl not found: {}", e);
+                let _ = app.emit("model-status", "error");
+                return;
+            }
+        }
+
+        eprintln!("[ablativo] download done, extracting...");
+        let _ = app.emit("model-status", "extracting");
+
+        // Delete partial previous extraction if any
+        let model_path = models_dir.join(MODEL_DIR_NAME);
+        if model_path.exists() {
+            let _ = std::fs::remove_dir_all(&model_path);
+        }
+
+        // Extract using Windows built-in tar.exe (fast, reliable, handles .tar.gz natively)
+        let extract = std::process::Command::new("tar")
+            .args([
+                "-xzf", tar_path.to_str().unwrap_or(""),
+                "-C",   models_dir.to_str().unwrap_or(""),
+            ])
+            .status();
+
+        let _ = std::fs::remove_file(&tar_path); // clean up temp file regardless
+
+        match extract {
+            Ok(s) if s.success() => {
+                eprintln!("[ablativo] extraction done, loading model...");
+                try_load_model(&app);
+            }
+            Ok(s) => {
+                eprintln!("[ablativo] tar extraction failed, exit code: {:?}", s.code());
+                let _ = app.emit("model-status", "error");
+            }
+            Err(e) => {
+                eprintln!("[ablativo] tar not found: {}", e);
+                let _ = app.emit("model-status", "error");
+            }
+        }
+    });
+
+    Ok(())
+}
 
 // ── Window commands ───────────────────────────────────────────────────────────
 
@@ -42,7 +167,7 @@ struct AppSettings(Mutex<Settings>);
 fn show_window(app: AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
-        let _ = w.set_focus(); // steal focus so Enter/Escape keyboard shortcuts work
+        let _ = w.set_focus();
     }
 }
 
@@ -88,13 +213,11 @@ fn set_hotkey(
 ) -> Result<(), String> {
     let new_shortcut = parse_shortcut(&hotkey)?;
 
-    // Unregister the current hotkey
     let current = settings.0.lock().unwrap().hotkey.clone();
     if let Ok(old) = parse_shortcut(&current) {
         let _ = app.global_shortcut().unregister(old);
     }
 
-    // Register the new one
     app.global_shortcut()
         .on_shortcut(new_shortcut, |app, _sc, event| {
             if event.state() == ShortcutState::Pressed {
@@ -105,7 +228,6 @@ fn set_hotkey(
         })
         .map_err(|e| e.to_string())?;
 
-    // Persist
     {
         let mut s = settings.0.lock().unwrap();
         s.hotkey = hotkey;
@@ -114,103 +236,117 @@ fn set_hotkey(
     Ok(())
 }
 
+// ── Transcription ─────────────────────────────────────────────────────────────
+
+/// Transcribe a Vec<f32> of 16 kHz mono PCM samples using Parakeet V3.
+/// `language` is accepted for API compatibility but ignored — Parakeet auto-detects.
 #[tauri::command]
-fn set_model(
-    model: String,
-    app: AppHandle,
-    model_path: State<'_, ModelPath>,
-    settings: State<'_, AppSettings>,
-) -> Result<(), String> {
-    let full_path = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?
-        .join("models")
-        .join(&model);
+fn transcribe(
+    engine: State<'_, ParakeetEngine>,
+    history: State<'_, History>,
+    audio: Vec<f32>,
+    language: String,
+) -> Result<String, String> {
+    let _ = language; // Parakeet auto-detects — no manual selection needed
 
-    if !full_path.exists() {
-        return Err(format!("Model file not found: {}", full_path.display()));
-    }
+    let mut guard = engine.0.lock().unwrap();
+    let model = guard
+        .as_mut()
+        .ok_or("Model not loaded. Open tray → Download model.")?;
 
-    *model_path.0.lock().unwrap() = Some(full_path);
-
-    let mut s = settings.0.lock().unwrap();
-    s.model = model;
-    save_settings(&app, &s)?;
-
-    Ok(())
-}
-
-#[tauri::command]
-fn list_models(app: AppHandle) -> Vec<String> {
-    let dir = match app.path().app_data_dir().ok().map(|d| d.join("models")) {
-        Some(d) => d,
-        None => return vec![],
+    let params = ParakeetParams {
+        timestamp_granularity: Some(TimestampGranularity::Segment),
+        ..Default::default()
     };
-    match std::fs::read_dir(&dir) {
-        Ok(entries) => entries
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| n.ends_with(".bin"))
-            .collect(),
-        Err(_) => vec![],
+
+    // Wrap in catch_unwind so a model panic doesn't poison the Mutex
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        model.transcribe_with(&audio, &params)
+    }))
+    .map_err(|_| "Transcription panicked".to_string())?
+    .map_err(|e| format!("Transcription failed: {}", e))?;
+
+    let text = result.text.trim().to_string();
+
+    if !text.is_empty() {
+        let mut h = history.0.lock().unwrap();
+        h.push_front(text.clone());
+        if h.len() > 5 {
+            h.pop_back();
+        }
+    }
+
+    Ok(text)
+}
+
+// ── Clipboard / paste ─────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn paste_text(text: String, app: AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.hide();
+    }
+    do_paste(text);
+}
+
+#[tauri::command]
+fn paste_from_history(text: String, app: AppHandle) {
+    if let Some(w) = app.get_webview_window("settings") {
+        let _ = w.close();
+    }
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        set_clipboard(&text);
+        send_ctrl_v();
+    });
+}
+
+#[tauri::command]
+fn copy_to_clipboard(text: String) {
+    set_clipboard(&text);
+}
+
+#[tauri::command]
+fn get_history(history: State<'_, History>) -> Vec<String> {
+    history.0.lock().unwrap().iter().cloned().collect()
+}
+
+fn do_paste(text: String) {
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        set_clipboard(&text);
+        send_ctrl_v();
+    });
+}
+
+fn set_clipboard(text: &str) {
+    if let Ok(mut cb) = Clipboard::new() {
+        let _ = cb.set_text(text);
     }
 }
 
-// ── Binary + model resolution ─────────────────────────────────────────────────
-
-fn resolve_whisper_bin(app: &AppHandle) -> Option<PathBuf> {
-    // 1. Production: next to the exe (Tauri bundles sidecar here)
-    if let Ok(exe) = std::env::current_exe() {
-        for name in &["whisper-cli.exe", "whisper-cli-x86_64-pc-windows-msvc.exe"] {
-            let p = exe.with_file_name(name);
-            if p.exists() {
-                return Some(p);
-            }
-        }
-    }
-    // 2. AppData — user placed the binary here
-    if let Ok(data) = app.path().app_data_dir() {
-        let p = data.join("whisper-cli.exe");
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    // 3. Dev: walk up from exe to find src-tauri/binaries/
-    if let Ok(exe) = std::env::current_exe() {
-        let mut dir = exe.parent().map(|p| p.to_path_buf());
-        for _ in 0..6 {
-            if let Some(d) = dir {
-                let candidate = d
-                    .join("src-tauri")
-                    .join("binaries")
-                    .join("whisper-cli-x86_64-pc-windows-msvc.exe");
-                if candidate.exists() {
-                    return Some(candidate);
-                }
-                dir = d.parent().map(|p| p.to_path_buf());
-            } else {
-                break;
-            }
-        }
-    }
-    None
-}
-
-fn resolve_model_path(app: &AppHandle, model_name: &str) -> Option<PathBuf> {
-    if let Ok(data) = app.path().app_data_dir() {
-        let p = data.join("models").join(model_name);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    None
+fn send_ctrl_v() {
+    std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            "Add-Type -AssemblyName System.Windows.Forms; \
+             [System.Windows.Forms.SendKeys]::SendWait('^v')",
+        ])
+        .spawn()
+        .ok();
 }
 
 // ── Settings persistence ──────────────────────────────────────────────────────
 
 fn settings_path(app: &AppHandle) -> Option<PathBuf> {
-    app.path().app_data_dir().ok().map(|d| d.join("settings.json"))
+    app.path()
+        .app_data_dir()
+        .ok()
+        .map(|d| d.join("settings.json"))
 }
 
 fn load_settings(app: &AppHandle) -> Settings {
@@ -283,160 +419,13 @@ fn parse_shortcut(s: &str) -> Result<Shortcut, String> {
     Ok(Shortcut::new(if mods.is_empty() { None } else { Some(mods) }, code))
 }
 
-// ── Transcription ─────────────────────────────────────────────────────────────
-
-fn write_wav(path: &PathBuf, samples: &[f32], sample_rate: u32) -> Result<(), String> {
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-    let mut writer = hound::WavWriter::create(path, spec).map_err(|e| e.to_string())?;
-    for &s in samples {
-        let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-        writer.write_sample(v).map_err(|e| e.to_string())?;
-    }
-    writer.finalize().map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn transcribe(
-    whisper_bin: State<'_, WhisperBin>,
-    model_path: State<'_, ModelPath>,
-    history: State<'_, History>,
-    audio: Vec<f32>,
-    language: String,
-) -> Result<String, String> {
-    let bin = whisper_bin.0.lock().unwrap();
-    let bin = bin.as_ref().ok_or("whisper-cli not found")?;
-
-    let model = model_path.0.lock().unwrap();
-    let model = model.as_ref().ok_or("Model not found")?;
-
-    let wav_path = std::env::temp_dir().join("ablativo_audio.wav");
-    write_wav(&wav_path, &audio, 16_000)?;
-
-    let lang_arg = if language == "auto" { "auto" } else { &language };
-    let bin_dir  = bin.parent().unwrap_or(bin.as_path());
-
-    let output = std::process::Command::new(bin)
-        .args([
-            "-m", model.to_str().unwrap(),
-            "-f", wav_path.to_str().unwrap(),
-            "-l", lang_arg,
-            "-np", // suppress info — emit only transcript
-            "-nt", // no timestamps
-        ])
-        .current_dir(bin_dir)
-        .output()
-        .map_err(|e| format!("Failed to spawn whisper-cli: {}", e))?;
-
-    let _ = std::fs::remove_file(&wav_path);
-
-    eprintln!(
-        "[ablativo] whisper exit={} stdout={:?}",
-        output.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&output.stdout)
-    );
-
-    if !output.status.success() {
-        return Err(format!(
-            "whisper-cli failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-
-    let text: String = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    // Append to history (max 5)
-    if !text.is_empty() {
-        let mut h = history.0.lock().unwrap();
-        h.push_front(text.clone());
-        if h.len() > 5 {
-            h.pop_back();
-        }
-    }
-
-    Ok(text)
-}
-
-// ── Clipboard / paste ─────────────────────────────────────────────────────────
-
-/// Set clipboard to text, hide pill, wait 150 ms, then simulate Ctrl+V.
-#[tauri::command]
-fn paste_text(text: String, app: AppHandle) {
-    if let Some(w) = app.get_webview_window("main") {
-        let _ = w.hide();
-    }
-    do_paste(text);
-}
-
-/// Close settings window, wait 250 ms for focus to return, then paste.
-#[tauri::command]
-fn paste_from_history(text: String, app: AppHandle) {
-    if let Some(w) = app.get_webview_window("settings") {
-        let _ = w.close();
-    }
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(250));
-        set_clipboard(&text);
-        send_ctrl_v();
-    });
-}
-
-/// Just set the clipboard (no paste simulation).
-#[tauri::command]
-fn copy_to_clipboard(text: String) {
-    set_clipboard(&text);
-}
-
-#[tauri::command]
-fn get_history(history: State<'_, History>) -> Vec<String> {
-    history.0.lock().unwrap().iter().cloned().collect()
-}
-
-fn do_paste(text: String) {
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        set_clipboard(&text);
-        send_ctrl_v();
-    });
-}
-
-fn set_clipboard(text: &str) {
-    if let Ok(mut cb) = Clipboard::new() {
-        let _ = cb.set_text(text);
-    }
-}
-
-fn send_ctrl_v() {
-    std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-WindowStyle",
-            "Hidden",
-            "-Command",
-            "Add-Type -AssemblyName System.Windows.Forms; \
-             [System.Windows.Forms.SendKeys]::SendWait('^v')",
-        ])
-        .spawn()
-        .ok();
-}
-
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 fn toggle_pill(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         match w.is_visible() {
             Ok(true)  => { let _ = w.hide(); }
-            Ok(false) => { let _ = w.show(); }
+            Ok(false) => { let _ = w.show(); let _ = w.set_focus(); }
             Err(_)    => {}
         }
     }
@@ -447,10 +436,12 @@ fn toggle_pill(app: &AppHandle) {
 fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let show_hide = MenuItemBuilder::with_id("show_hide", "Show / Hide").build(app)?;
     let settings  = MenuItemBuilder::with_id("settings",  "Settings…").build(app)?;
+    let download  = MenuItemBuilder::with_id("download",  "Download model").build(app)?;
     let sep       = PredefinedMenuItem::separator(app)?;
     let quit      = MenuItemBuilder::with_id("quit",      "Quit Ablativo").build(app)?;
+
     let menu = MenuBuilder::new(app)
-        .items(&[&show_hide, &settings, &sep, &quit])
+        .items(&[&show_hide, &settings, &download, &sep, &quit])
         .build()?;
 
     TrayIconBuilder::new()
@@ -460,6 +451,7 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .on_menu_event(|app, event| match event.id().as_ref() {
             "show_hide" => toggle_pill(app),
             "settings"  => { let _ = open_settings(app.clone()); }
+            "download"  => { let _ = download_model(app.clone()); }
             "quit"      => app.exit(0),
             _           => {}
         })
@@ -514,14 +506,15 @@ fn position_pill(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>>
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        .manage(WhisperBin(Mutex::new(None)))
-        .manage(ModelPath(Mutex::new(None)))
+        .manage(ParakeetEngine(Mutex::new(None)))
         .manage(History(Mutex::new(VecDeque::new())))
         .manage(AppSettings(Mutex::new(Settings::default())))
         .invoke_handler(tauri::generate_handler![
             show_window,
             hide_window,
             open_settings,
+            check_model,
+            download_model,
             transcribe,
             paste_text,
             paste_from_history,
@@ -529,31 +522,24 @@ pub fn run() {
             get_history,
             get_settings,
             set_hotkey,
-            set_model,
-            list_models,
         ])
         .setup(|app| {
-            // Load persisted settings
             let settings = load_settings(app.handle());
-
-            // Resolve binary
-            let bin = resolve_whisper_bin(app.handle());
-            *app.state::<WhisperBin>().0.lock().unwrap() = bin;
-
-            // Resolve model from settings
-            let model = resolve_model_path(app.handle(), &settings.model);
-            *app.state::<ModelPath>().0.lock().unwrap() = model;
-
-            // Store settings in state
             *app.state::<AppSettings>().0.lock().unwrap() = settings.clone();
 
-            // Register hotkey from settings
             if let Err(e) = setup_shortcut_str(app, &settings.hotkey) {
-                eprintln!("[ablativo] Shortcut registration failed: {}. Is another instance running?", e);
+                eprintln!("[ablativo] Shortcut failed: {}. Another instance running?", e);
             }
 
             setup_tray(app)?;
             position_pill(app)?;
+
+            // Load Parakeet model in background — non-blocking startup
+            let app_handle = app.handle().clone();
+            std::thread::spawn(move || {
+                try_load_model(&app_handle);
+            });
+
             Ok(())
         })
         .run(tauri::generate_context!())

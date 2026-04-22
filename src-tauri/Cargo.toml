@@ -15,8 +15,12 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-global-shortcut = "2"
-hound = "3"
 arboard = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+[target.'cfg(target_os = "windows")'.dependencies]
+transcribe-rs = { version = "=0.3.8", features = ["onnx", "ort-directml"] }
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+transcribe-rs = { version = "=0.3.8", features = ["onnx"] }

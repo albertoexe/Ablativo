@@ -3,18 +3,19 @@
  */
 
 const { invoke } = window.__TAURI__.core;
+const { listen }  = window.__TAURI__.event;
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
-let pendingHotkey  = null; // null = unchanged
-let pendingModel   = null; // null = unchanged
-let captureMode    = false;
+let pendingHotkey = null;
+let captureMode   = false;
 
 // ── Elements ──────────────────────────────────────────────────────────────────
 
 const hotkeyDisplay = document.getElementById('hotkeyDisplay');
 const hotkeyHint    = document.getElementById('hotkeyHint');
-const modelSelect   = document.getElementById('modelSelect');
+const modelStatus   = document.getElementById('modelStatus');
+const downloadBtn   = document.getElementById('downloadBtn');
 const historyList   = document.getElementById('historyList');
 const saveBtn       = document.getElementById('saveBtn');
 
@@ -22,35 +23,49 @@ const saveBtn       = document.getElementById('saveBtn');
 
 async function init() {
   try {
-    const [settings, models, history] = await Promise.all([
+    const [settings, modelReady, history] = await Promise.all([
       invoke('get_settings'),
-      invoke('list_models'),
+      invoke('check_model'),
       invoke('get_history'),
     ]);
 
-    // Hotkey
     hotkeyDisplay.textContent = formatHotkey(settings.hotkey);
-
-    // Model picker
-    modelSelect.innerHTML = '';
-    if (models.length === 0) {
-      modelSelect.innerHTML = '<option value="">No models found</option>';
-    } else {
-      models.forEach((m) => {
-        const opt = document.createElement('option');
-        opt.value = m;
-        opt.textContent = modelDisplayName(m);
-        if (m === settings.model) opt.selected = true;
-        modelSelect.appendChild(opt);
-      });
-    }
-
-    // History
+    updateModelUI(modelReady ? 'ready' : 'not-found');
     renderHistory(history);
   } catch (err) {
     console.error('[settings] init error:', err);
   }
 }
+
+// ── Model status ──────────────────────────────────────────────────────────────
+
+function updateModelUI(status) {
+  const labels = {
+    'ready':       { text: '✓ Ready',       show: false },
+    'not-found':   { text: 'Not downloaded', show: true  },
+    'downloading': { text: 'Downloading…',  show: false },
+    'extracting':  { text: 'Extracting…',   show: false },
+    'error':       { text: 'Error — retry', show: true  },
+  };
+  const s = labels[status] || { text: status, show: false };
+  modelStatus.textContent = s.text;
+  downloadBtn.style.display = s.show ? 'block' : 'none';
+}
+
+// Listen for model status events from Rust
+listen('model-status', (e) => updateModelUI(e.payload));
+listen('model-ready',  ()  => updateModelUI('ready'));
+
+downloadBtn.addEventListener('click', async () => {
+  downloadBtn.disabled = true;
+  try {
+    await invoke('download_model');
+  } catch (err) {
+    console.error('[settings] download error:', err);
+    updateModelUI('error');
+    downloadBtn.disabled = false;
+  }
+});
 
 // ── Hotkey capture ────────────────────────────────────────────────────────────
 
@@ -66,13 +81,11 @@ document.addEventListener('keydown', (e) => {
   if (!captureMode) return;
   e.preventDefault();
 
-  // Escape cancels capture
   if (e.code === 'Escape') {
     cancelCapture();
     return;
   }
 
-  // Ignore lone modifier keys
   const modifierCodes = ['ControlLeft','ControlRight','AltLeft','AltRight',
                          'ShiftLeft','ShiftRight','MetaLeft','MetaRight'];
   if (modifierCodes.includes(e.code)) return;
@@ -94,18 +107,11 @@ document.addEventListener('keydown', (e) => {
 function cancelCapture() {
   captureMode = false;
   hotkeyDisplay.classList.remove('capturing');
-  // Restore current display (either pendingHotkey or saved hotkey)
   invoke('get_settings').then((s) => {
     hotkeyDisplay.textContent = formatHotkey(pendingHotkey || s.hotkey);
   });
   hotkeyHint.textContent = 'click to reconfigure';
 }
-
-// ── Model change ──────────────────────────────────────────────────────────────
-
-modelSelect.addEventListener('change', () => {
-  pendingModel = modelSelect.value;
-});
 
 // ── History ───────────────────────────────────────────────────────────────────
 
@@ -175,10 +181,6 @@ saveBtn.addEventListener('click', async () => {
       await invoke('set_hotkey', { hotkey: pendingHotkey });
       pendingHotkey = null;
     }
-    if (pendingModel) {
-      await invoke('set_model', { model: pendingModel });
-      pendingModel = null;
-    }
     saveBtn.textContent = 'Saved ✓';
     setTimeout(() => { saveBtn.textContent = 'Save'; saveBtn.disabled = false; }, 1200);
   } catch (err) {
@@ -194,20 +196,15 @@ function formatHotkey(hotkey) {
   return hotkey.split('+').join(' + ');
 }
 
-function modelDisplayName(filename) {
-  return filename.replace(/^ggml-/, '').replace(/\.bin$/, '');
-}
-
 function codeToName(code) {
-  if (code.startsWith('Key'))   return code.slice(3);   // KeyA → A
-  if (code.startsWith('Digit')) return code.slice(5);   // Digit1 → 1
+  if (code.startsWith('Key'))   return code.slice(3);
+  if (code.startsWith('Digit')) return code.slice(5);
   const names = {
     Space: 'Space', Enter: 'Enter', Escape: 'Escape',
     Tab: 'Tab', Backspace: 'Backspace',
     F1:'F1',F2:'F2',F3:'F3',F4:'F4',F5:'F5',F6:'F6',
     F7:'F7',F8:'F8',F9:'F9',F10:'F10',F11:'F11',F12:'F12',
-    Minus:'Minus', Equal:'Equal', BracketLeft:'[', BracketRight:']',
-    Semicolon:';', Quote:"'", Comma:',', Period:'.', Slash:'/',
+    Minus:'Minus', Equal:'Equal',
   };
   return names[code] || code;
 }

@@ -30,9 +30,14 @@
     <!-- ── Model ──────────────────────────────────────────── -->
     <section class="section">
       <div class="section-label">MODEL</div>
-      <select id="modelSelect" class="select">
-        <option value="">Loading…</option>
-      </select>
+      <div id="modelCard" class="model-card">
+        <div class="model-info">
+          <span class="model-name">Parakeet V3</span>
+          <span class="model-tag">Multilingual · CPU</span>
+        </div>
+        <div id="modelStatus" class="model-status">Checking…</div>
+      </div>
+      <button id="downloadBtn" class="btn-secondary" style="display:none">Download model (456 MB)</button>
     </section>
 
     <div class="divider"></div>
