@@ -8,6 +8,7 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, State,
 };
+use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use transcribe_rs::onnx::parakeet::{ParakeetModel, ParakeetParams, TimestampGranularity};
 use transcribe_rs::onnx::Quantization;
@@ -22,12 +23,19 @@ const MODEL_DIR_NAME: &str = "parakeet-tdt-0.6b-v3-int8";
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct Settings {
     hotkey: String,
+    /// Language hint passed to the transcription frontend.
+    /// Parakeet auto-detects language so this is stored but not used by the engine.
+    #[serde(default = "default_language")]
+    language: String,
 }
+
+fn default_language() -> String { "auto".into() }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             hotkey: "Ctrl+Space".into(),
+            language: default_language(),
         }
     }
 }
@@ -191,7 +199,7 @@ fn open_settings(app: AppHandle) -> Result<(), String> {
         tauri::WebviewUrl::App("settings.html".into()),
     )
     .title("Ablativo")
-    .inner_size(460.0, 560.0)
+    .inner_size(460.0, 620.0)
     .resizable(false)
     .build()
     .map_err(|e| e.to_string())?;
@@ -283,10 +291,19 @@ fn transcribe(
 
 #[tauri::command]
 fn paste_text(text: String, app: AppHandle) {
+    // Hide the pill immediately so focus returns to the target window,
+    // then paste after the OS has had time to restore focus.
+    // Emits 'paste-done' after paste completes so the frontend resets state.
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.hide();
     }
-    do_paste(text);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        set_clipboard(&text);
+        send_ctrl_v();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let _ = app.emit("paste-done", ());
+    });
 }
 
 #[tauri::command]
@@ -306,17 +323,28 @@ fn copy_to_clipboard(text: String) {
     set_clipboard(&text);
 }
 
+// ── Autostart ─────────────────────────────────────────────────────────────────
+
+/// Returns true if Ablativo is registered to launch on login.
+#[tauri::command]
+fn get_autostart(app: AppHandle) -> bool {
+    app.autolaunch().is_enabled().unwrap_or(false)
+}
+
+/// Enable or disable launch-on-login. Writes directly to the OS (registry on
+/// Windows, launchd on macOS) — no settings.json involved.
+#[tauri::command]
+fn set_autostart(enable: bool, app: AppHandle) -> Result<(), String> {
+    if enable {
+        app.autolaunch().enable().map_err(|e| e.to_string())
+    } else {
+        app.autolaunch().disable().map_err(|e| e.to_string())
+    }
+}
+
 #[tauri::command]
 fn get_history(history: State<'_, History>) -> Vec<String> {
     history.0.lock().unwrap().iter().cloned().collect()
-}
-
-fn do_paste(text: String) {
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        set_clipboard(&text);
-        send_ctrl_v();
-    });
 }
 
 fn set_clipboard(text: &str) {
@@ -505,6 +533,10 @@ fn position_pill(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>>
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::Builder::new(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ).build())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(ParakeetEngine(Mutex::new(None)))
         .manage(History(Mutex::new(VecDeque::new())))
@@ -522,6 +554,8 @@ pub fn run() {
             get_history,
             get_settings,
             set_hotkey,
+            get_autostart,
+            set_autostart,
         ])
         .setup(|app| {
             let settings = load_settings(app.handle());

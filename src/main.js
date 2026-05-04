@@ -2,45 +2,66 @@
  * main.js — Ablativo frontend state machine
  *
  * State machine:
- *   idle  ──[hotkey]──▶  recording  ──[hotkey / Enter]──▶  transcribing
- *                  ◀──[Escape]──          ──[done / error]──▶  idle (+ paste)
+ *   idle  ──[hotkey]──▶  loading  ──[mic ready]──▶  recording
+ *                 ◀──[Escape]──    ──[hotkey / Enter]──▶  transcribing
+ *                                  ──[paste-done]──▶  idle
  *
- * Transcription is handled by whisper-cli sidecar (Rust side).
- * No model warmup needed — subprocess is spawned per recording.
+ * All animation is handled by PillAnimator (canvas-based).
+ * Rust emits 'paste-done' after clipboard paste completes, which drives
+ * the final transition back to idle so the dots show until text lands.
  */
 
 import { startRecording, stopRecording, cancelRecording } from './audio.js';
+import { PillAnimator } from './animator.js';
 
 const { invoke } = window.__TAURI__.core;
 const { listen }  = window.__TAURI__.event;
 
+// ── Elements & animator ───────────────────────────────────────────────────────
+
+const pill    = document.getElementById('pill');
+const canvas  = document.getElementById('pill-canvas');
+const anim    = new PillAnimator(canvas);
+
 // ── State ─────────────────────────────────────────────────────────────────────
 
-let state = 'idle'; // 'idle' | 'recording' | 'transcribing'
-let rafId = null;
+let state = 'idle'; // 'idle' | 'loading' | 'recording' | 'transcribing'
+let LANGUAGE = 'en';
 
-const pill = document.getElementById('pill');
-let LANGUAGE = 'en'; // updated from settings on boot
-
-// Fetch persisted language from settings (best-effort — defaults to 'en')
 invoke('get_settings').then((s) => { LANGUAGE = s.language || 'en'; }).catch(() => {});
 
 // ── State machine ─────────────────────────────────────────────────────────────
 
 function setState(newState) {
   state = newState;
-  pill.className = newState === 'idle' ? 'recording' : newState;
+
+  // Pill class drives CSS (glass effect on transcribing, etc.)
+  pill.className = newState === 'idle' ? 'loading' : newState;
+
+  // Sync animator — recording handled separately (needs analyser node)
+  switch (newState) {
+    case 'idle':
+    case 'loading':
+      anim.setLoading();
+      break;
+    case 'transcribing':
+      anim.setTranscribing();
+      break;
+    // 'recording' is set explicitly in startCapture after analyser is ready
+  }
 }
 
 async function startCapture() {
   if (state !== 'idle') return;
 
   await invoke('show_window');
-  setState('recording');
+  setState('loading');                // spinner while getUserMedia initialises
 
   try {
     const analyser = await startRecording();
-    animateWaveform(analyser);
+    state          = 'recording';
+    pill.className = 'recording';
+    anim.setRecording(analyser);      // animator transitions spinner → waveform
   } catch (err) {
     console.error('[ablativo] mic error:', err);
     await invoke('hide_window');
@@ -51,8 +72,7 @@ async function startCapture() {
 async function finishCapture() {
   if (state !== 'recording') return;
 
-  cancelAnimationFrame(rafId);
-  setState('transcribing');
+  setState('transcribing');           // animator transitions waveform → dots
 
   let audio;
   try {
@@ -65,7 +85,7 @@ async function finishCapture() {
   }
 
   if (!audio || audio.length < 1600) {
-    // Less than 0.1s — nothing to transcribe
+    // Less than 0.1 s — nothing to transcribe
     await invoke('hide_window');
     setState('idle');
     return;
@@ -73,55 +93,44 @@ async function finishCapture() {
 
   try {
     const text = await invoke('transcribe', {
-      audio: Array.from(audio), // Vec<f32> on the Rust side
+      audio: Array.from(audio),   // Vec<f32> on the Rust side
       language: LANGUAGE,
     });
 
     if (text && text.trim()) {
-      await invoke('paste_text', { text: text.trim() }); // paste_text also hides the window
+      // paste_text hides the window and emits 'paste-done' after paste completes.
+      // Do NOT call setState('idle') here — wait for the event so the dots
+      // keep showing right up until the text lands in the target app.
+      await invoke('paste_text', { text: text.trim() });
     } else {
       await invoke('hide_window');
+      setState('idle');
     }
   } catch (err) {
     console.error('[ablativo] transcribe error:', err);
     await invoke('hide_window');
+    setState('idle');
   }
-
-  setState('idle');
 }
 
 async function cancelCapture() {
   if (state === 'idle') return;
-  cancelAnimationFrame(rafId);
   cancelRecording();
   await invoke('hide_window');
   setState('idle');
 }
 
-// ── Waveform ──────────────────────────────────────────────────────────────────
-
-function animateWaveform(analyser) {
-  const bars = pill.querySelectorAll('.waveform span');
-  const data = new Uint8Array(analyser.frequencyBinCount);
-
-  function draw() {
-    rafId = requestAnimationFrame(draw);
-    analyser.getByteFrequencyData(data);
-    bars.forEach((bar, i) => {
-      const idx = Math.floor((i * data.length) / bars.length);
-      const h   = Math.max(4, (data[idx] / 255) * 22);
-      bar.style.height = `${h}px`;
-    });
-  }
-  draw();
-}
-
 // ── Rust events ───────────────────────────────────────────────────────────────
 
 listen('hotkey', async () => {
-  if (state === 'idle')      await startCapture();
+  if (state === 'idle')           await startCapture();
   else if (state === 'recording') await finishCapture();
-  // ignore if transcribing
+  // ignore if loading or transcribing
+});
+
+// Fired by Rust after paste completes — resets state so next hotkey works
+listen('paste-done', () => {
+  setState('idle');
 });
 
 // ── Keyboard ──────────────────────────────────────────────────────────────────

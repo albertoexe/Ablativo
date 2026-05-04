@@ -12,30 +12,45 @@ let captureMode   = false;
 
 // ── Elements ──────────────────────────────────────────────────────────────────
 
-const hotkeyDisplay = document.getElementById('hotkeyDisplay');
-const hotkeyHint    = document.getElementById('hotkeyHint');
-const modelStatus   = document.getElementById('modelStatus');
-const downloadBtn   = document.getElementById('downloadBtn');
-const historyList   = document.getElementById('historyList');
-const saveBtn       = document.getElementById('saveBtn');
+const hotkeyDisplay   = document.getElementById('hotkeyDisplay');
+const hotkeyHint      = document.getElementById('hotkeyHint');
+const autostartToggle = document.getElementById('autostartToggle');
+const modelStatus     = document.getElementById('modelStatus');
+const downloadBtn     = document.getElementById('downloadBtn');
+const historyList     = document.getElementById('historyList');
+const saveBtn         = document.getElementById('saveBtn');
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
 async function init() {
   try {
-    const [settings, modelReady, history] = await Promise.all([
+    const [settings, modelReady, history, autostart] = await Promise.all([
       invoke('get_settings'),
       invoke('check_model'),
       invoke('get_history'),
+      invoke('get_autostart'),
     ]);
 
     hotkeyDisplay.textContent = formatHotkey(settings.hotkey);
+    autostartToggle.checked   = autostart;
     updateModelUI(modelReady ? 'ready' : 'not-found');
     renderHistory(history);
   } catch (err) {
     console.error('[settings] init error:', err);
   }
 }
+
+// ── Autostart toggle — applies immediately (OS setting, no Save needed) ───────
+
+autostartToggle.addEventListener('change', async () => {
+  try {
+    await invoke('set_autostart', { enable: autostartToggle.checked });
+  } catch (err) {
+    console.error('[settings] autostart error:', err);
+    // Revert the visual state if the OS call failed
+    autostartToggle.checked = !autostartToggle.checked;
+  }
+});
 
 // ── Model status ──────────────────────────────────────────────────────────────
 

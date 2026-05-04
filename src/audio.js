@@ -34,7 +34,7 @@ export async function startRecording() {
   // AnalyserNode — for real-time waveform visualisation only (not capture)
   const source = audioCtx.createMediaStreamSource(stream);
   analyser = audioCtx.createAnalyser();
-  analyser.fftSize = 256;
+  analyser.fftSize = 1024; // more bins = better per-bar frequency resolution
   source.connect(analyser);
 
   // MediaRecorder — reliable in WebView2, replaces deprecated ScriptProcessorNode

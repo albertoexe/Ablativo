@@ -1,9 +1,11 @@
 {
-  "name": "ablativo-tauri",
+  "name": "ablativo",
   "private": true,
-  "version": "0.1.0",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
     "tauri": "tauri"
   },
   "devDependencies": {

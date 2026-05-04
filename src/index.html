@@ -7,26 +7,9 @@
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-  <div id="pill" class="recording">
-
-    <!-- Recording: red dot + waveform -->
-    <div class="rec-content">
-      <div class="dot"></div>
-      <div class="waveform">
-        <span></span><span></span><span></span><span></span><span></span>
-      </div>
-    </div>
-
-    <!-- Transcribing: bouncing dots only -->
-    <div class="tx-content">
-      <div class="tx-dots">
-        <span></span><span></span><span></span>
-      </div>
-    </div>
-
+  <div id="pill" class="loading">
+    <canvas id="pill-canvas"></canvas>
   </div>
-
-  <!-- type="module" enables ES import/export between main.js and audio.js -->
   <script type="module" src="main.js"></script>
 </body>
 </html>

@@ -1,0 +1,148 @@
+# Ablativo — Release workflow
+#
+# Triggers on a version tag push (e.g. `git tag v1.0.0 && git push --tags`).
+# Builds signed Windows installers and unsigned macOS DMGs, then attaches
+# them to a GitHub Release.
+#
+# SETUP (one-time, per repo):
+#   • Go to Settings → Secrets and variables → Actions
+#   • No extra secrets needed for unsigned builds — GITHUB_TOKEN is automatic.
+#   • For macOS Gatekeeper signing, add APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD,
+#     APPLE_SIGNING_IDENTITY, APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID and uncomment
+#     the signing env vars in the macOS job below.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+
+  # ── Windows ──────────────────────────────────────────────────────────────────
+  build-windows:
+    name: Windows (x86_64)
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+          cache: 'npm'
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build & publish release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Ablativo ${{ github.ref_name }}'
+          releaseBody: |
+            ## Installation
+
+            ### Windows
+            Download `Ablativo_x64-setup.exe` (NSIS installer) or `Ablativo_x64_en-US.msi`.
+
+            ### macOS
+            Download `Ablativo_aarch64.dmg` (Apple Silicon) or `Ablativo_x64.dmg` (Intel).
+            > **Note:** macOS builds are unsigned. Right-click → Open on first launch to bypass Gatekeeper.
+
+            ### First run
+            Open **Settings** from the tray icon and click **Download model** to fetch Parakeet V3 (~456 MB, one-time download). Transcription starts working immediately after.
+          releaseDraft: false
+          prerelease: false
+          args: --target x86_64-pc-windows-msvc
+
+  # ── macOS Apple Silicon ───────────────────────────────────────────────────────
+  build-macos-arm:
+    name: macOS (Apple Silicon)
+    runs-on: macos-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+          cache: 'npm'
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build & publish release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Uncomment + configure secrets for Gatekeeper signing:
+          # APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          # APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          # APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # APPLE_ID: ${{ secrets.APPLE_ID }}
+          # APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          # APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Ablativo ${{ github.ref_name }}'
+          releaseDraft: false
+          prerelease: false
+          args: --target aarch64-apple-darwin
+
+  # ── macOS Intel ───────────────────────────────────────────────────────────────
+  build-macos-intel:
+    name: macOS (Intel)
+    runs-on: macos-13
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+          cache: 'npm'
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build & publish release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Ablativo ${{ github.ref_name }}'
+          releaseDraft: false
+          prerelease: false
+          args: --target x86_64-apple-darwin
