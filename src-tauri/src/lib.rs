@@ -377,28 +377,24 @@ fn set_clipboard(text: &str) {
 }
 
 fn send_ctrl_v() {
-    #[cfg(target_os = "windows")]
-    std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-WindowStyle",
-            "Hidden",
-            "-Command",
-            "Add-Type -AssemblyName System.Windows.Forms; \
-             [System.Windows.Forms.SendKeys]::SendWait('^v')",
-        ])
-        .spawn()
-        .ok();
+    // enigo calls SendInput (Windows) / CGEvent (macOS) directly —
+    // no subprocess, no window flash, no focus steal.
+    use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 
+    // macOS paste = Cmd+V; Windows/Linux paste = Ctrl+V
     #[cfg(target_os = "macos")]
-    std::process::Command::new("osascript")
-        .args([
-            "-e",
-            "tell application \"System Events\" to keystroke \"v\" using command down",
-        ])
-        .spawn()
-        .ok();
+    let modifier = Key::Meta;
+    #[cfg(not(target_os = "macos"))]
+    let modifier = Key::Control;
+
+    match Enigo::new(&Settings::default()) {
+        Ok(mut e) => {
+            let _ = e.key(modifier, Direction::Press);
+            let _ = e.key(Key::Unicode('v'), Direction::Click);
+            let _ = e.key(modifier, Direction::Release);
+        }
+        Err(err) => eprintln!("[ablativo] enigo paste error: {}", err),
+    }
 }
 
 // ── Settings persistence ──────────────────────────────────────────────────────

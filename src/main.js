@@ -75,6 +75,10 @@ async function startCapture() {
     anim.setRecording(analyser);      // animator transitions spinner → waveform
   } catch (err) {
     console.error('[ablativo] mic error:', err);
+    // Show a brief "no mic" state before hiding so the user knows why it vanished
+    pill.className = 'error';
+    anim.setError?.();                // graceful — animator may not have setError
+    await new Promise((r) => setTimeout(r, 1200));
     await invoke('hide_window');
     setState('idle');
   }
