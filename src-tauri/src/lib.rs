@@ -377,6 +377,7 @@ fn set_clipboard(text: &str) {
 }
 
 fn send_ctrl_v() {
+    #[cfg(target_os = "windows")]
     std::process::Command::new("powershell")
         .args([
             "-NoProfile",
@@ -386,6 +387,15 @@ fn send_ctrl_v() {
             "-Command",
             "Add-Type -AssemblyName System.Windows.Forms; \
              [System.Windows.Forms.SendKeys]::SendWait('^v')",
+        ])
+        .spawn()
+        .ok();
+
+    #[cfg(target_os = "macos")]
+    std::process::Command::new("osascript")
+        .args([
+            "-e",
+            "tell application \"System Events\" to keystroke \"v\" using command down",
         ])
         .spawn()
         .ok();
