@@ -10,14 +10,14 @@ const { listen }  = window.__TAURI__.event;
 
 // ── Elements ──────────────────────────────────────────────────────────────────
 
-const hotkeyDisplay    = document.getElementById('hotkeyDisplay');
-const hotkeyHint       = document.getElementById('hotkeyHint');
-const hotkeyReset      = document.getElementById('hotkeyReset');
+const hotkeyDisplay     = document.getElementById('hotkeyDisplay');
+const hotkeyHint        = document.getElementById('hotkeyHint');
+const hotkeyReset       = document.getElementById('hotkeyReset');
 const enterToStopToggle = document.getElementById('enterToStopToggle');
-const autostartToggle  = document.getElementById('autostartToggle');
-const modelBadge      = document.getElementById('modelBadge');
-const downloadBtn     = document.getElementById('downloadBtn');
-const historyList     = document.getElementById('historyList');
+const autostartToggle   = document.getElementById('autostartToggle');
+const modelBadge        = document.getElementById('modelBadge');
+const downloadBtn       = document.getElementById('downloadBtn');
+const historyList       = document.getElementById('historyList');
 
 // ── Tab navigation ────────────────────────────────────────────────────────────
 
@@ -127,13 +127,10 @@ document.addEventListener('keydown', async (e) => {
   // Save immediately — no Save button needed
   try {
     await invoke('set_hotkey', { hotkey });
-    setHint('✓ Saved', 'saved');
-    setTimeout(() => setHint('click to change', ''), 1800);
+    setHint('✓ Saved', 'saved', 1800);
   } catch (err) {
     console.error('[settings] set_hotkey error:', err);
-    setHint('Error — try again', 'error');
-    setTimeout(() => setHint('click to change', ''), 2500);
-    // Restore previous display
+    setHint('Error — try again', 'error', 2500);
     invoke('get_settings').then((s) => {
       hotkeyDisplay.textContent = formatHotkey(s.hotkey);
     }).catch(() => {});
@@ -149,9 +146,16 @@ function cancelCapture() {
   }).catch(() => {});
 }
 
-function setHint(text, state) {
+let _hintTimer = null;
+
+/** Set hint text + optional CSS state. Pass resetMs > 0 to auto-reset to "click to change". */
+function setHint(text, state, resetMs = 0) {
+  clearTimeout(_hintTimer);
   hotkeyHint.textContent = text;
   hotkeyHint.className   = `row-hint${state ? ` ${state}` : ''}`;
+  if (resetMs > 0) {
+    _hintTimer = setTimeout(() => setHint('click to change', ''), resetMs);
+  }
 }
 
 // ── Hotkey reset button ───────────────────────────────────────────────────────
@@ -161,12 +165,10 @@ hotkeyReset.addEventListener('click', async () => {
   try {
     await invoke('set_hotkey', { hotkey: DEFAULT });
     hotkeyDisplay.textContent = formatHotkey(DEFAULT);
-    setHint('✓ Reset to default', 'saved');
-    setTimeout(() => setHint('click to change', ''), 1800);
+    setHint('✓ Reset to default', 'saved', 1800);
   } catch (err) {
     console.error('[settings] reset error:', err);
-    setHint('Error — try again', 'error');
-    setTimeout(() => setHint('click to change', ''), 2500);
+    setHint('Error — try again', 'error', 2500);
   }
 });
 
