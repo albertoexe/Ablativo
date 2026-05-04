@@ -27,15 +27,20 @@ struct Settings {
     /// Parakeet auto-detects language so this is stored but not used by the engine.
     #[serde(default = "default_language")]
     language: String,
+    /// Whether pressing Enter while recording stops and transcribes.
+    #[serde(default = "default_enter_to_stop")]
+    enter_to_stop: bool,
 }
 
-fn default_language() -> String { "auto".into() }
+fn default_language()     -> String { "auto".into() }
+fn default_enter_to_stop() -> bool  { true }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            hotkey: "Ctrl+Space".into(),
-            language: default_language(),
+            hotkey:         "Ctrl+Space".into(),
+            language:       default_language(),
+            enter_to_stop:  default_enter_to_stop(),
         }
     }
 }
@@ -199,7 +204,7 @@ fn open_settings(app: AppHandle) -> Result<(), String> {
         tauri::WebviewUrl::App("settings.html".into()),
     )
     .title("Ablativo")
-    .inner_size(460.0, 620.0)
+    .inner_size(500.0, 500.0)
     .resizable(false)
     .build()
     .map_err(|e| e.to_string())?;
@@ -236,11 +241,29 @@ fn set_hotkey(
         })
         .map_err(|e| e.to_string())?;
 
-    {
+    let updated = {
         let mut s = settings.0.lock().unwrap();
         s.hotkey = hotkey;
         save_settings(&app, &s)?;
-    }
+        s.clone()
+    };
+    let _ = app.emit("settings-changed", updated);
+    Ok(())
+}
+
+#[tauri::command]
+fn set_enter_to_stop(
+    value: bool,
+    app: AppHandle,
+    settings: State<'_, AppSettings>,
+) -> Result<(), String> {
+    let updated = {
+        let mut s = settings.0.lock().unwrap();
+        s.enter_to_stop = value;
+        save_settings(&app, &s)?;
+        s.clone()
+    };
+    let _ = app.emit("settings-changed", updated);
     Ok(())
 }
 
@@ -533,10 +556,7 @@ fn position_pill(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>>
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_autostart::Builder::new(
-            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
-        ).build())
+        .plugin(tauri_plugin_autostart::Builder::new().build())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(ParakeetEngine(Mutex::new(None)))
         .manage(History(Mutex::new(VecDeque::new())))
@@ -554,6 +574,7 @@ pub fn run() {
             get_history,
             get_settings,
             set_hotkey,
+            set_enter_to_stop,
             get_autostart,
             set_autostart,
         ])

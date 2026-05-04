@@ -1,24 +1,34 @@
 /**
  * settings.js — Ablativo Settings window
+ *
+ * Three panes: General (hotkey + autostart), Model, History.
+ * All settings apply immediately — no Save button.
  */
 
 const { invoke } = window.__TAURI__.core;
 const { listen }  = window.__TAURI__.event;
 
-// ── State ─────────────────────────────────────────────────────────────────────
-
-let pendingHotkey = null;
-let captureMode   = false;
-
 // ── Elements ──────────────────────────────────────────────────────────────────
 
-const hotkeyDisplay   = document.getElementById('hotkeyDisplay');
-const hotkeyHint      = document.getElementById('hotkeyHint');
-const autostartToggle = document.getElementById('autostartToggle');
-const modelStatus     = document.getElementById('modelStatus');
+const hotkeyDisplay    = document.getElementById('hotkeyDisplay');
+const hotkeyHint       = document.getElementById('hotkeyHint');
+const hotkeyReset      = document.getElementById('hotkeyReset');
+const enterToStopToggle = document.getElementById('enterToStopToggle');
+const autostartToggle  = document.getElementById('autostartToggle');
+const modelBadge      = document.getElementById('modelBadge');
 const downloadBtn     = document.getElementById('downloadBtn');
 const historyList     = document.getElementById('historyList');
-const saveBtn         = document.getElementById('saveBtn');
+
+// ── Tab navigation ────────────────────────────────────────────────────────────
+
+document.querySelectorAll('.nav-item').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.nav-item').forEach((b) => b.classList.remove('active'));
+    document.querySelectorAll('.pane').forEach((p) => p.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById(`pane-${btn.dataset.pane}`).classList.add('active');
+  });
+});
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
@@ -31,45 +41,37 @@ async function init() {
       invoke('get_autostart'),
     ]);
 
-    hotkeyDisplay.textContent = formatHotkey(settings.hotkey);
-    autostartToggle.checked   = autostart;
-    updateModelUI(modelReady ? 'ready' : 'not-found');
+    hotkeyDisplay.textContent    = formatHotkey(settings.hotkey);
+    enterToStopToggle.checked    = settings.enter_to_stop !== false;
+    autostartToggle.checked      = autostart;
+    updateModelBadge(modelReady ? 'active' : 'not-found');
     renderHistory(history);
   } catch (err) {
     console.error('[settings] init error:', err);
   }
 }
 
-// ── Autostart toggle — applies immediately (OS setting, no Save needed) ───────
-
-autostartToggle.addEventListener('change', async () => {
-  try {
-    await invoke('set_autostart', { enable: autostartToggle.checked });
-  } catch (err) {
-    console.error('[settings] autostart error:', err);
-    // Revert the visual state if the OS call failed
-    autostartToggle.checked = !autostartToggle.checked;
-  }
-});
-
 // ── Model status ──────────────────────────────────────────────────────────────
 
-function updateModelUI(status) {
-  const labels = {
-    'ready':       { text: '✓ Ready',       show: false },
-    'not-found':   { text: 'Not downloaded', show: true  },
-    'downloading': { text: 'Downloading…',  show: false },
-    'extracting':  { text: 'Extracting…',   show: false },
-    'error':       { text: 'Error — retry', show: true  },
+function updateModelBadge(status) {
+  const states = {
+    'active':       { text: '✓ Active',       cls: 'active',      download: false },
+    'not-found':    { text: 'Not downloaded', cls: 'not-found',   download: true  },
+    'downloading':  { text: 'Downloading…',   cls: 'downloading', download: false },
+    'extracting':   { text: 'Extracting…',    cls: 'extracting',  download: false },
+    'error':        { text: 'Error — retry',  cls: 'error',       download: true  },
+    'checking':     { text: 'Checking…',      cls: 'checking',    download: false },
   };
-  const s = labels[status] || { text: status, show: false };
-  modelStatus.textContent = s.text;
-  downloadBtn.style.display = s.show ? 'block' : 'none';
+
+  const s = states[status] ?? { text: status, cls: 'checking', download: false };
+
+  modelBadge.textContent = s.text;
+  modelBadge.className   = `model-badge ${s.cls}`;
+  downloadBtn.style.display = s.download ? 'block' : 'none';
 }
 
-// Listen for model status events from Rust
-listen('model-status', (e) => updateModelUI(e.payload));
-listen('model-ready',  ()  => updateModelUI('ready'));
+listen('model-status', (e) => updateModelBadge(e.payload));
+listen('model-ready',  ()  => updateModelBadge('active'));
 
 downloadBtn.addEventListener('click', async () => {
   downloadBtn.disabled = true;
@@ -77,22 +79,24 @@ downloadBtn.addEventListener('click', async () => {
     await invoke('download_model');
   } catch (err) {
     console.error('[settings] download error:', err);
-    updateModelUI('error');
+    updateModelBadge('error');
     downloadBtn.disabled = false;
   }
 });
 
-// ── Hotkey capture ────────────────────────────────────────────────────────────
+// ── Hotkey capture — saves immediately on new shortcut ────────────────────────
+
+let captureMode = false;
 
 hotkeyDisplay.addEventListener('click', () => {
   if (captureMode) return;
   captureMode = true;
   hotkeyDisplay.textContent = 'Press shortcut…';
   hotkeyDisplay.classList.add('capturing');
-  hotkeyHint.textContent = 'press Escape to cancel';
+  setHint('press Escape to cancel', '');
 });
 
-document.addEventListener('keydown', (e) => {
+document.addEventListener('keydown', async (e) => {
   if (!captureMode) return;
   e.preventDefault();
 
@@ -101,8 +105,11 @@ document.addEventListener('keydown', (e) => {
     return;
   }
 
-  const modifierCodes = ['ControlLeft','ControlRight','AltLeft','AltRight',
-                         'ShiftLeft','ShiftRight','MetaLeft','MetaRight'];
+  // Ignore lone modifier keys
+  const modifierCodes = [
+    'ControlLeft','ControlRight','AltLeft','AltRight',
+    'ShiftLeft','ShiftRight','MetaLeft','MetaRight',
+  ];
   if (modifierCodes.includes(e.code)) return;
 
   const parts = [];
@@ -112,21 +119,78 @@ document.addEventListener('keydown', (e) => {
   if (e.metaKey)  parts.push('Meta');
   parts.push(codeToName(e.code));
 
-  pendingHotkey = parts.join('+');
-  hotkeyDisplay.textContent = formatHotkey(pendingHotkey);
+  const hotkey = parts.join('+');
+  hotkeyDisplay.textContent = formatHotkey(hotkey);
   hotkeyDisplay.classList.remove('capturing');
-  hotkeyHint.textContent = 'click to reconfigure';
   captureMode = false;
+
+  // Save immediately — no Save button needed
+  try {
+    await invoke('set_hotkey', { hotkey });
+    setHint('✓ Saved', 'saved');
+    setTimeout(() => setHint('click to change', ''), 1800);
+  } catch (err) {
+    console.error('[settings] set_hotkey error:', err);
+    setHint('Error — try again', 'error');
+    setTimeout(() => setHint('click to change', ''), 2500);
+    // Restore previous display
+    invoke('get_settings').then((s) => {
+      hotkeyDisplay.textContent = formatHotkey(s.hotkey);
+    }).catch(() => {});
+  }
 });
 
 function cancelCapture() {
   captureMode = false;
   hotkeyDisplay.classList.remove('capturing');
+  setHint('click to change', '');
   invoke('get_settings').then((s) => {
-    hotkeyDisplay.textContent = formatHotkey(pendingHotkey || s.hotkey);
-  });
-  hotkeyHint.textContent = 'click to reconfigure';
+    hotkeyDisplay.textContent = formatHotkey(s.hotkey);
+  }).catch(() => {});
 }
+
+function setHint(text, state) {
+  hotkeyHint.textContent = text;
+  hotkeyHint.className   = `row-hint${state ? ` ${state}` : ''}`;
+}
+
+// ── Hotkey reset button ───────────────────────────────────────────────────────
+
+hotkeyReset.addEventListener('click', async () => {
+  const DEFAULT = 'Ctrl+Space';
+  try {
+    await invoke('set_hotkey', { hotkey: DEFAULT });
+    hotkeyDisplay.textContent = formatHotkey(DEFAULT);
+    setHint('✓ Reset to default', 'saved');
+    setTimeout(() => setHint('click to change', ''), 1800);
+  } catch (err) {
+    console.error('[settings] reset error:', err);
+    setHint('Error — try again', 'error');
+    setTimeout(() => setHint('click to change', ''), 2500);
+  }
+});
+
+// ── Enter-to-stop toggle — applies immediately ────────────────────────────────
+
+enterToStopToggle.addEventListener('change', async () => {
+  try {
+    await invoke('set_enter_to_stop', { value: enterToStopToggle.checked });
+  } catch (err) {
+    console.error('[settings] enter_to_stop error:', err);
+    enterToStopToggle.checked = !enterToStopToggle.checked; // revert on failure
+  }
+});
+
+// ── Autostart toggle — applies immediately ────────────────────────────────────
+
+autostartToggle.addEventListener('change', async () => {
+  try {
+    await invoke('set_autostart', { enable: autostartToggle.checked });
+  } catch (err) {
+    console.error('[settings] autostart error:', err);
+    autostartToggle.checked = !autostartToggle.checked; // revert on failure
+  }
+});
 
 // ── History ───────────────────────────────────────────────────────────────────
 
@@ -138,10 +202,10 @@ function renderHistory(items) {
 
   historyList.innerHTML = '';
   items.forEach((text) => {
-    const li = document.createElement('li');
-    li.className = 'history-item';
+    const li      = document.createElement('li');
+    li.className  = 'history-item';
 
-    const span = document.createElement('span');
+    const span    = document.createElement('span');
     span.className = 'history-text';
     span.textContent = text;
     span.title = text;
@@ -149,17 +213,8 @@ function renderHistory(items) {
     const actions = document.createElement('div');
     actions.className = 'history-actions';
 
-    const copyBtn = document.createElement('button');
-    copyBtn.className = 'btn-icon';
-    copyBtn.title = 'Copy';
-    copyBtn.textContent = '⎘';
-    copyBtn.addEventListener('click', () => copyText(text));
-
-    const pasteBtn = document.createElement('button');
-    pasteBtn.className = 'btn-icon';
-    pasteBtn.title = 'Paste';
-    pasteBtn.textContent = '▶';
-    pasteBtn.addEventListener('click', () => pasteText(text));
+    const copyBtn  = makeIconBtn('⎘', 'Copy',  () => copyText(text));
+    const pasteBtn = makeIconBtn('▶', 'Paste', () => pasteText(text));
 
     actions.appendChild(copyBtn);
     actions.appendChild(pasteBtn);
@@ -169,41 +224,24 @@ function renderHistory(items) {
   });
 }
 
+function makeIconBtn(label, title, onClick) {
+  const btn = document.createElement('button');
+  btn.className = 'btn-icon';
+  btn.title = title;
+  btn.textContent = label;
+  btn.addEventListener('click', onClick);
+  return btn;
+}
+
 async function copyText(text) {
-  try {
-    await invoke('copy_to_clipboard', { text });
-  } catch (err) {
-    console.error('[settings] copy error:', err);
-  }
+  try { await invoke('copy_to_clipboard', { text }); }
+  catch (err) { console.error('[settings] copy error:', err); }
 }
 
 async function pasteText(text) {
-  try {
-    await invoke('paste_from_history', { text });
-  } catch (err) {
-    console.error('[settings] paste error:', err);
-  }
+  try { await invoke('paste_from_history', { text }); }
+  catch (err) { console.error('[settings] paste error:', err); }
 }
-
-// ── Save ──────────────────────────────────────────────────────────────────────
-
-saveBtn.addEventListener('click', async () => {
-  saveBtn.disabled = true;
-  saveBtn.textContent = 'Saving…';
-
-  try {
-    if (pendingHotkey) {
-      await invoke('set_hotkey', { hotkey: pendingHotkey });
-      pendingHotkey = null;
-    }
-    saveBtn.textContent = 'Saved ✓';
-    setTimeout(() => { saveBtn.textContent = 'Save'; saveBtn.disabled = false; }, 1200);
-  } catch (err) {
-    console.error('[settings] save error:', err);
-    saveBtn.textContent = 'Error — try again';
-    saveBtn.disabled = false;
-  }
-});
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -214,14 +252,13 @@ function formatHotkey(hotkey) {
 function codeToName(code) {
   if (code.startsWith('Key'))   return code.slice(3);
   if (code.startsWith('Digit')) return code.slice(5);
-  const names = {
-    Space: 'Space', Enter: 'Enter', Escape: 'Escape',
-    Tab: 'Tab', Backspace: 'Backspace',
+  const map = {
+    Space:'Space', Enter:'Enter', Escape:'Escape', Tab:'Tab', Backspace:'Backspace',
+    Minus:'Minus', Equal:'Equal',
     F1:'F1',F2:'F2',F3:'F3',F4:'F4',F5:'F5',F6:'F6',
     F7:'F7',F8:'F8',F9:'F9',F10:'F10',F11:'F11',F12:'F12',
-    Minus:'Minus', Equal:'Equal',
   };
-  return names[code] || code;
+  return map[code] ?? code;
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────

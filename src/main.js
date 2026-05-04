@@ -25,10 +25,21 @@ const anim    = new PillAnimator(canvas);
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
-let state = 'idle'; // 'idle' | 'loading' | 'recording' | 'transcribing'
-let LANGUAGE = 'en';
+let state        = 'idle'; // 'idle' | 'loading' | 'recording' | 'transcribing'
+let LANGUAGE     = 'en';
+let enterToStop  = true;  // mirrors Settings.enter_to_stop
 
-invoke('get_settings').then((s) => { LANGUAGE = s.language || 'en'; }).catch(() => {});
+invoke('get_settings').then((s) => {
+  LANGUAGE    = s.language      || 'en';
+  enterToStop = s.enter_to_stop !== false; // default true
+}).catch(() => {});
+
+// Keep in sync when changed from the Settings window
+listen('settings-changed', (e) => {
+  if (e.payload && typeof e.payload.enter_to_stop === 'boolean') {
+    enterToStop = e.payload.enter_to_stop;
+  }
+});
 
 // ── State machine ─────────────────────────────────────────────────────────────
 
@@ -136,7 +147,7 @@ listen('paste-done', () => {
 // ── Keyboard ──────────────────────────────────────────────────────────────────
 
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && state === 'recording') {
+  if (e.key === 'Enter' && enterToStop && state === 'recording') {
     e.preventDefault();
     finishCapture();
   } else if (e.key === 'Escape') {
