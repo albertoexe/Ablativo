@@ -14,11 +14,21 @@ use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use transcribe_rs::onnx::parakeet::{ParakeetModel, ParakeetParams, TimestampGranularity};
 use transcribe_rs::onnx::Quantization;
+use vad_rs::Vad;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const MODEL_URL: &str = "https://blob.handy.computer/parakeet-v3-int8.tar.gz";
 const MODEL_DIR_NAME: &str = "parakeet-tdt-0.6b-v3-int8";
+const SILERO_VAD_FILE_NAME: &str = "silero_vad_v4.onnx";
+const SILERO_VAD_BYTES: &[u8] = include_bytes!("../resources/models/silero_vad_v4.onnx");
+const VAD_SAMPLE_RATE: usize = 16_000;
+const VAD_FRAME_MS: usize = 30;
+const VAD_FRAME_SAMPLES: usize = VAD_SAMPLE_RATE * VAD_FRAME_MS / 1000;
+const VAD_THRESHOLD: f32 = 0.30;
+const VAD_ONSET_FRAMES: usize = 2;
+const VAD_PREFILL_FRAMES: usize = 4;
+const VAD_HANGOVER_FRAMES: usize = 8;
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 
@@ -50,6 +60,7 @@ impl Default for Settings {
 // ── Managed state ─────────────────────────────────────────────────────────────
 
 struct ParakeetEngine(Mutex<Option<ParakeetModel>>);
+struct SileroVadEngine(Mutex<Option<Vad>>);
 struct History(Mutex<VecDeque<String>>);
 struct AppSettings(Mutex<Settings>);
 
@@ -79,6 +90,26 @@ fn model_dir(app: &AppHandle) -> Option<PathBuf> {
         .map(|d| d.join("models").join(MODEL_DIR_NAME))
 }
 
+fn vad_model_path(app: &AppHandle) -> Option<PathBuf> {
+    app.path()
+        .app_data_dir()
+        .ok()
+        .map(|d| d.join("models").join(SILERO_VAD_FILE_NAME))
+}
+
+fn ensure_vad_model(app: &AppHandle) -> Result<PathBuf, String> {
+    let path = vad_model_path(app).ok_or("Could not resolve app data dir for VAD model")?;
+    if path.exists() {
+        return Ok(path);
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&path, SILERO_VAD_BYTES).map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
 /// Load Parakeet from disk into state. Call from a background thread.
 fn try_load_model(app: &AppHandle) {
     if let Some(path) = model_dir(app) {
@@ -98,6 +129,23 @@ fn try_load_model(app: &AppHandle) {
         } else {
             eprintln!("[ablativo] model not found at {:?}", path);
             let _ = app.emit("model-status", "not-found");
+        }
+    }
+}
+
+fn try_load_vad(app: &AppHandle) {
+    let Ok(path) = ensure_vad_model(app) else {
+        eprintln!("[ablativo] failed to materialize Silero VAD model");
+        return;
+    };
+
+    match Vad::new(&path, VAD_SAMPLE_RATE) {
+        Ok(vad) => {
+            *app.state::<SileroVadEngine>().0.lock().unwrap() = Some(vad);
+            eprintln!("[ablativo] Silero VAD ready");
+        }
+        Err(e) => {
+            eprintln!("[ablativo] Silero VAD load failed: {}", e);
         }
     }
 }
@@ -411,6 +459,105 @@ fn resample_to_16k(samples: &[f32], from_rate: u32) -> Vec<f32> {
         .collect()
 }
 
+/// Trim leading and trailing silence from a 16 kHz mono clip using Silero VAD.
+/// Safe fallback: if VAD finds no speech, return the original clip unchanged.
+fn trim_silence_with_vad(
+    app: &AppHandle,
+    vad_engine: &SileroVadEngine,
+    samples: &[f32],
+) -> Result<Vec<f32>, String> {
+    if samples.len() < VAD_FRAME_SAMPLES {
+        return Ok(samples.to_vec());
+    }
+
+    let vad_path = ensure_vad_model(app)?;
+    let mut guard = vad_engine.0.lock().unwrap();
+    if guard.is_none() {
+        *guard = Some(
+            Vad::new(&vad_path, VAD_SAMPLE_RATE)
+                .map_err(|e| format!("Failed to create Silero VAD: {e}"))?,
+        );
+    }
+    let vad = guard.as_mut().unwrap();
+    vad.reset();
+
+    let frame_count = samples.len().div_ceil(VAD_FRAME_SAMPLES);
+    let mut padded = samples.to_vec();
+    padded.resize(frame_count * VAD_FRAME_SAMPLES, 0.0);
+
+    let mut first_keep_frame: Option<usize> = None;
+    let mut last_keep_frame: Option<usize> = None;
+    let mut in_speech = false;
+    let mut onset_counter = 0usize;
+    let mut hangover_counter = 0usize;
+
+    for frame_idx in 0..frame_count {
+        let start = frame_idx * VAD_FRAME_SAMPLES;
+        let end = start + VAD_FRAME_SAMPLES;
+        let prob = vad
+            .compute(&padded[start..end])
+            .map_err(|e| format!("Silero VAD failed: {e}"))?
+            .prob;
+        let is_voice = prob > VAD_THRESHOLD;
+
+        match (in_speech, is_voice) {
+            (false, true) => {
+                onset_counter += 1;
+                if onset_counter >= VAD_ONSET_FRAMES {
+                    in_speech = true;
+                    hangover_counter = VAD_HANGOVER_FRAMES;
+                    let speech_start = frame_idx + 1 - onset_counter;
+                    let keep_from = speech_start.saturating_sub(VAD_PREFILL_FRAMES);
+                    first_keep_frame.get_or_insert(keep_from);
+                    last_keep_frame = Some(frame_idx);
+                }
+            }
+            (false, false) => {
+                onset_counter = 0;
+            }
+            (true, true) => {
+                onset_counter = 0;
+                hangover_counter = VAD_HANGOVER_FRAMES;
+                last_keep_frame = Some(frame_idx);
+            }
+            (true, false) => {
+                onset_counter = 0;
+                if hangover_counter > 0 {
+                    hangover_counter -= 1;
+                    last_keep_frame = Some(frame_idx);
+                } else {
+                    in_speech = false;
+                }
+            }
+        }
+    }
+
+    let Some(first_frame) = first_keep_frame else {
+        eprintln!("[ablativo] VAD found no speech; keeping original clip");
+        return Ok(samples.to_vec());
+    };
+    let Some(last_frame) = last_keep_frame else {
+        eprintln!("[ablativo] VAD end marker missing; keeping original clip");
+        return Ok(samples.to_vec());
+    };
+
+    let start = first_frame * VAD_FRAME_SAMPLES;
+    let end = ((last_frame + 1) * VAD_FRAME_SAMPLES).min(samples.len());
+    if end <= start {
+        eprintln!("[ablativo] VAD trim produced invalid range; keeping original clip");
+        return Ok(samples.to_vec());
+    }
+
+    let trimmed = samples[start..end].to_vec();
+    eprintln!(
+        "[ablativo] VAD trim: {} -> {} samples ({:.0} ms removed)",
+        samples.len(),
+        trimmed.len(),
+        ((samples.len().saturating_sub(trimmed.len())) as f32 / VAD_SAMPLE_RATE as f32) * 1000.0
+    );
+    Ok(trimmed)
+}
+
 /// Build a cpal input stream that accumulates mono f32 samples into `buf`.
 /// Handles F32, I16, I32 sample formats; mixes down multi-channel to mono.
 fn open_input_stream(
@@ -528,6 +675,7 @@ fn start_recording(
 fn stop_and_transcribe(
     app: AppHandle,
     recording: State<'_, ActiveRecording>,
+    vad_engine: State<'_, SileroVadEngine>,
     engine: State<'_, ParakeetEngine>,
     history: State<'_, History>,
 ) -> Result<(), String> {
@@ -551,6 +699,7 @@ fn stop_and_transcribe(
 
     // ── 3. Resample to 16 kHz ────────────────────────────────────────────────
     let pcm16k = resample_to_16k(&raw, sample_rate);
+    let pcm16k = trim_silence_with_vad(&app, &vad_engine, &pcm16k)?;
 
     // Minimum 0.1 s of audio at 16 kHz = 1600 samples
     if pcm16k.len() < 1600 {
@@ -811,6 +960,7 @@ pub fn run() {
         .plugin(tauri_plugin_autostart::Builder::new().build())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(ParakeetEngine(Mutex::new(None)))
+        .manage(SileroVadEngine(Mutex::new(None)))
         .manage(History(Mutex::new(VecDeque::new())))
         .manage(AppSettings(Mutex::new(Settings::default())))
         .manage(ActiveRecording(Mutex::new(None)))
@@ -849,6 +999,7 @@ pub fn run() {
             let app_handle = app.handle().clone();
             std::thread::spawn(move || {
                 try_load_model(&app_handle);
+                try_load_vad(&app_handle);
             });
 
             Ok(())

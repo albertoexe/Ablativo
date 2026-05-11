@@ -21,6 +21,7 @@ cpal = "0.15"
 enigo = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+vad-rs = { git = "https://github.com/cjpais/vad-rs", default-features = false }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 transcribe-rs = { version = "=0.3.8", features = ["onnx", "ort-directml"] }
