@@ -1,8 +1,10 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use arboard::Clipboard;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -50,6 +52,23 @@ impl Default for Settings {
 struct ParakeetEngine(Mutex<Option<ParakeetModel>>);
 struct History(Mutex<VecDeque<String>>);
 struct AppSettings(Mutex<Settings>);
+
+/// Live recording session — held for the duration of a single dictation.
+struct RecordingSession {
+    /// Keep alive to maintain the cpal audio stream; drop to stop capture.
+    stream: cpal::Stream,
+    /// Raw mono PCM samples at the device's native sample rate.
+    samples: Arc<Mutex<Vec<f32>>>,
+    /// Native device sample rate (e.g. 48000).
+    sample_rate: u32,
+    /// Set to false to stop the RMS-emitter thread.
+    running: Arc<AtomicBool>,
+}
+
+// cpal::Stream is Send but !Sync — wrapping in Mutex makes this Send+Sync.
+unsafe impl Send for RecordingSession {}
+
+struct ActiveRecording(Mutex<Option<RecordingSession>>);
 
 // ── Model helpers ─────────────────────────────────────────────────────────────
 
@@ -370,6 +389,233 @@ fn get_history(history: State<'_, History>) -> Vec<String> {
     history.0.lock().unwrap().iter().cloned().collect()
 }
 
+// ── Native audio recording ────────────────────────────────────────────────────
+
+/// Resample mono f32 PCM from `from_rate` Hz down to 16 000 Hz using linear
+/// interpolation — sufficient quality for speech transcription.
+fn resample_to_16k(samples: &[f32], from_rate: u32) -> Vec<f32> {
+    if from_rate == 16_000 {
+        return samples.to_vec();
+    }
+    let ratio = from_rate as f64 / 16_000.0;
+    let out_len = (samples.len() as f64 / ratio) as usize;
+    let last = samples.len().saturating_sub(1);
+    (0..out_len)
+        .map(|i| {
+            let src = i as f64 * ratio;
+            let lo = src as usize;
+            let hi = (lo + 1).min(last);
+            let t = (src - lo as f64) as f32;
+            samples[lo] * (1.0 - t) + samples[hi] * t
+        })
+        .collect()
+}
+
+/// Build a cpal input stream that accumulates mono f32 samples into `buf`.
+/// Handles F32, I16, I32 sample formats; mixes down multi-channel to mono.
+fn open_input_stream(
+    device: &cpal::Device,
+    config: &cpal::SupportedStreamConfig,
+    buf: Arc<Mutex<Vec<f32>>>,
+) -> Result<cpal::Stream, String> {
+    let channels = config.channels() as usize;
+    let stream_config: cpal::StreamConfig = config.config();
+    let err_fn = |e| eprintln!("[ablativo] cpal stream error: {e}");
+
+    macro_rules! build {
+        ($ty:ty, $scale:expr) => {{
+            let buf = buf.clone();
+            device
+                .build_input_stream(
+                    &stream_config,
+                    move |data: &[$ty], _| {
+                        let mut s = buf.lock().unwrap();
+                        for frame in data.chunks(channels) {
+                            let sum: f32 =
+                                frame.iter().map(|&x| x as f32 / $scale).sum();
+                            s.push(sum / channels as f32);
+                        }
+                    },
+                    err_fn,
+                    None,
+                )
+                .map_err(|e| e.to_string())
+        }};
+    }
+
+    match config.sample_format() {
+        cpal::SampleFormat::F32 => {
+            let buf = buf.clone();
+            device
+                .build_input_stream(
+                    &stream_config,
+                    move |data: &[f32], _| {
+                        let mut s = buf.lock().unwrap();
+                        for frame in data.chunks(channels) {
+                            s.push(frame.iter().sum::<f32>() / channels as f32);
+                        }
+                    },
+                    err_fn,
+                    None,
+                )
+                .map_err(|e| e.to_string())
+        }
+        cpal::SampleFormat::I16 => build!(i16, i16::MAX as f32),
+        cpal::SampleFormat::I32 => build!(i32, i32::MAX as f32),
+        other => Err(format!("Unsupported sample format: {other:?}")),
+    }
+}
+
+/// Start capturing microphone audio into native Rust buffers.
+/// Emits `audio-level` (f32 RMS, 0.0–1.0) every ~30 ms for waveform display.
+#[tauri::command]
+fn start_recording(
+    app: AppHandle,
+    recording: State<'_, ActiveRecording>,
+) -> Result<(), String> {
+    let mut guard = recording.0.lock().unwrap();
+    if guard.is_some() {
+        return Err("Already recording".into());
+    }
+
+    let host = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .ok_or("No microphone found")?;
+    let config = device
+        .default_input_config()
+        .map_err(|e| e.to_string())?;
+
+    let sample_rate = config.sample_rate().0;
+    let samples = Arc::new(Mutex::new(Vec::<f32>::new()));
+    let running = Arc::new(AtomicBool::new(true));
+
+    // Spawn RMS-emitter thread — sends a float every 30 ms for the waveform.
+    {
+        let samples_rms = samples.clone();
+        let running_rms = running.clone();
+        let app_rms = app.clone();
+        std::thread::spawn(move || {
+            let mut last_len = 0usize;
+            while running_rms.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                let s = samples_rms.lock().unwrap();
+                let new_len = s.len();
+                if new_len > last_len {
+                    let slice = &s[last_len..new_len];
+                    let rms = (slice.iter().map(|x| x * x).sum::<f32>()
+                        / slice.len() as f32)
+                        .sqrt();
+                    // Scale up — raw mic RMS is small; cap at 1.0.
+                    let _ = app_rms.emit("audio-level", (rms * 5.0).min(1.0_f32));
+                    last_len = new_len;
+                }
+                drop(s);
+            }
+        });
+    }
+
+    let stream = open_input_stream(&device, &config, samples.clone())?;
+    stream.play().map_err(|e| e.to_string())?;
+
+    *guard = Some(RecordingSession { stream, samples, sample_rate, running });
+    Ok(())
+}
+
+/// Stop capture, resample to 16 kHz, transcribe, and paste — all in Rust.
+/// Emits `paste-done` when finished (whether text was found or not).
+#[tauri::command]
+fn stop_and_transcribe(
+    app: AppHandle,
+    recording: State<'_, ActiveRecording>,
+    engine: State<'_, ParakeetEngine>,
+    history: State<'_, History>,
+) -> Result<(), String> {
+    // ── 1. Take and stop the session ─────────────────────────────────────────
+    let session = recording
+        .0
+        .lock()
+        .unwrap()
+        .take()
+        .ok_or("Not recording")?;
+
+    let RecordingSession { stream, samples, sample_rate, running } = session;
+    running.store(false, Ordering::Relaxed); // stop RMS thread
+    drop(stream);                             // cpal blocks until audio thread exits
+
+    // ── 2. Take captured samples ─────────────────────────────────────────────
+    let raw = match Arc::try_unwrap(samples) {
+        Ok(m)  => m.into_inner().unwrap(),
+        Err(a) => a.lock().unwrap().clone(),
+    };
+
+    // ── 3. Resample to 16 kHz ────────────────────────────────────────────────
+    let pcm16k = resample_to_16k(&raw, sample_rate);
+
+    // Minimum 0.1 s of audio at 16 kHz = 1600 samples
+    if pcm16k.len() < 1600 {
+        eprintln!("[ablativo] clip too short ({} samples) — skipping", pcm16k.len());
+        if let Some(w) = app.get_webview_window("main") { let _ = w.hide(); }
+        let _ = app.emit("paste-done", ());
+        return Ok(());
+    }
+
+    // ── 4. Transcribe ────────────────────────────────────────────────────────
+    let text = {
+        let mut guard = engine.0.lock().unwrap();
+        let model = guard
+            .as_mut()
+            .ok_or("Model not loaded. Open tray → Download model.")?;
+
+        let params = ParakeetParams {
+            timestamp_granularity: Some(TimestampGranularity::Segment),
+            ..Default::default()
+        };
+
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            model.transcribe_with(&pcm16k, &params)
+        }))
+        .map_err(|_| "Transcription panicked".to_string())?
+        .map_err(|e| format!("Transcription failed: {e}"))?
+        .text
+        .trim()
+        .to_string()
+    };
+
+    // ── 5. History ───────────────────────────────────────────────────────────
+    if !text.is_empty() {
+        let mut h = history.0.lock().unwrap();
+        h.push_front(text.clone());
+        if h.len() > 5 { h.pop_back(); }
+    }
+
+    // ── 6. Paste or dismiss ──────────────────────────────────────────────────
+    if text.is_empty() {
+        if let Some(w) = app.get_webview_window("main") { let _ = w.hide(); }
+        let _ = app.emit("paste-done", ());
+    } else {
+        if let Some(w) = app.get_webview_window("main") { let _ = w.hide(); }
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            set_clipboard(&text);
+            send_ctrl_v();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let _ = app.emit("paste-done", ());
+        });
+    }
+
+    Ok(())
+}
+
+/// Discard the current recording without transcribing.
+#[tauri::command]
+fn cancel_recording(recording: State<'_, ActiveRecording>) {
+    if let Some(session) = recording.0.lock().unwrap().take() {
+        session.running.store(false, Ordering::Relaxed);
+        drop(session.stream);
+    }
+}
+
 fn set_clipboard(text: &str) {
     if let Ok(mut cb) = Clipboard::new() {
         let _ = cb.set_text(text);
@@ -567,6 +813,7 @@ pub fn run() {
         .manage(ParakeetEngine(Mutex::new(None)))
         .manage(History(Mutex::new(VecDeque::new())))
         .manage(AppSettings(Mutex::new(Settings::default())))
+        .manage(ActiveRecording(Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
             show_window,
             hide_window,
@@ -574,6 +821,9 @@ pub fn run() {
             check_model,
             download_model,
             transcribe,
+            start_recording,
+            stop_and_transcribe,
+            cancel_recording,
             paste_text,
             paste_from_history,
             copy_to_clipboard,

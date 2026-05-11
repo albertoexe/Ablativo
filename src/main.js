@@ -11,7 +11,6 @@
  * the final transition back to idle so the dots show until text lands.
  */
 
-import { startRecording, stopRecording, cancelRecording } from './audio.js';
 import { PillAnimator } from './animator.js';
 
 const { invoke } = window.__TAURI__.core;
@@ -66,18 +65,17 @@ async function startCapture() {
   if (state !== 'idle') return;
 
   await invoke('show_window');
-  setState('loading');                // spinner while getUserMedia initialises
+  setState('loading');                // spinner while mic opens
 
   try {
-    const analyser = await startRecording();
+    await invoke('start_recording');  // opens cpal mic — native, no browser API
     state          = 'recording';
     pill.className = 'recording';
-    anim.setRecording(analyser);      // animator transitions spinner → waveform
+    anim.setRecording();              // animator transitions spinner → waveform
   } catch (err) {
     console.error('[ablativo] mic error:', err);
-    // Show a brief "no mic" state before hiding so the user knows why it vanished
     pill.className = 'error';
-    anim.setError?.();                // graceful — animator may not have setError
+    anim.setError?.();
     await new Promise((r) => setTimeout(r, 1200));
     await invoke('hide_window');
     setState('idle');
@@ -89,38 +87,11 @@ async function finishCapture() {
 
   setState('transcribing');           // animator transitions waveform → dots
 
-  let audio;
   try {
-    audio = await stopRecording();
-  } catch (err) {
-    console.error('[ablativo] stop error:', err);
-    await invoke('hide_window');
-    setState('idle');
-    return;
-  }
-
-  if (!audio || audio.length < 1600) {
-    // Less than 0.1 s — nothing to transcribe
-    await invoke('hide_window');
-    setState('idle');
-    return;
-  }
-
-  try {
-    const text = await invoke('transcribe', {
-      audio: Array.from(audio),   // Vec<f32> on the Rust side
-      language: LANGUAGE,
-    });
-
-    if (text && text.trim()) {
-      // paste_text hides the window and emits 'paste-done' after paste completes.
-      // Do NOT call setState('idle') here — wait for the event so the dots
-      // keep showing right up until the text lands in the target app.
-      await invoke('paste_text', { text: text.trim() });
-    } else {
-      await invoke('hide_window');
-      setState('idle');
-    }
+    // Rust stops capture, resamples, transcribes, and pastes — all in one call.
+    // Audio never crosses the IPC bridge as JSON. Blocks until transcription done.
+    // Rust emits 'paste-done' when text lands (or immediately if nothing to paste).
+    await invoke('stop_and_transcribe');
   } catch (err) {
     console.error('[ablativo] transcribe error:', err);
     await invoke('hide_window');
@@ -130,7 +101,7 @@ async function finishCapture() {
 
 async function cancelCapture() {
   if (state === 'idle') return;
-  cancelRecording();
+  invoke('cancel_recording');         // fire-and-forget — no audio to return
   await invoke('hide_window');
   setState('idle');
 }
@@ -146,6 +117,11 @@ listen('hotkey', async () => {
 // Fired by Rust after paste completes — resets state so next hotkey works
 listen('paste-done', () => {
   setState('idle');
+});
+
+// RMS level from the native audio thread — drives waveform bars while recording
+listen('audio-level', (e) => {
+  anim.setLevel(e.payload);
 });
 
 // ── Keyboard ──────────────────────────────────────────────────────────────────

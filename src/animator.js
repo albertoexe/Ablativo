@@ -81,10 +81,8 @@ export class PillAnimator {
     this._morphT = 1;    // 0→1 while morphing, 1 = settled
     this._tStart = 0;
 
-    // Audio analyser (recording state only)
-    this.analyser  = null;
-    this._bufLen   = 0;
-    this._freqData = null;
+    // RMS level from the native audio thread (0.0 – 1.0)
+    this._rmsLevel = 0;
 
     // Frozen bar heights — used during rec→tx morph
     this._lastBarH = new Float32Array(BAR_N).fill(BAR_MIN);
@@ -112,13 +110,15 @@ export class PillAnimator {
     this._go('loading');
   }
 
-  setRecording(analyser) {
-    if (analyser) {
-      this.analyser  = analyser;
-      this._bufLen   = analyser.frequencyBinCount;
-      this._freqData = new Uint8Array(this._bufLen);
-    }
+  /** Call once when recording starts — no analyser needed anymore. */
+  setRecording() {
+    this._rmsLevel = 0;
     this._go('recording');
+  }
+
+  /** Called on every 'audio-level' event from Rust (~30 ms cadence). */
+  setLevel(rms) {
+    this._rmsLevel = rms;
   }
 
   setTranscribing() {
@@ -156,14 +156,18 @@ export class PillAnimator {
       this._morphT = clamp((ts - this._tStart) / TRANS_MS, 0, 1);
     }
 
-    // Sample frequency data only while settled in recording state
-    if (this._state === 'recording' && this.analyser) {
-      this.analyser.getByteFrequencyData(this._freqData);
-      const maxBin = Math.floor(this._bufLen * 0.35);
+    // Drive waveform bars from native RMS level (~30 ms updates from Rust).
+    // Each bar has a unique phase so they don't all move in lockstep.
+    // Fast attack (0.4), slow decay (0.85) — mirrors how real waveforms look.
+    if (this._state === 'recording') {
+      const rms = this._rmsLevel || 0;
       for (let i = 0; i < BAR_N; i++) {
-        const t   = i / (BAR_N - 1);
-        const idx = Math.round(Math.pow(t, 0.7) * maxBin);
-        this._lastBarH[i] = Math.max(BAR_MIN, (this._freqData[idx] / 255) * BAR_MAX);
+        const wave   = 0.5 + 0.5 * Math.sin(ts / 380 + i * 1.05);
+        const target = BAR_MIN + (BAR_MAX - BAR_MIN) * Math.min(rms, 1) * (0.55 + 0.45 * wave);
+        const prev   = this._lastBarH[i];
+        this._lastBarH[i] = target > prev
+          ? prev * 0.60 + target * 0.40   // fast attack
+          : prev * 0.85 + target * 0.15;  // slow decay
       }
     }
 
