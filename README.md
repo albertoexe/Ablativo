@@ -8,9 +8,9 @@ Built with [Tauri v2](https://tauri.app) (Rust + HTML/CSS/JS). Windows and macOS
 
 ## Current State
 
-- **Latest tagged release:** `v1.0.1` (2026-05-04)
+- **Release version:** `v1.2.0`
 - **Current codebase:** native `cpal` audio capture in Rust, local Parakeet V3 transcription, and Silero VAD silence trimming
-- **Next release:** should be cut after QA whenever you want docs and binaries aligned again
+- **Focus:** low-latency local dictation with minimal dead-air overhead
 
 ---
 
@@ -107,9 +107,8 @@ GitHub Actions builds Windows + macOS installers and publishes them to a new Git
 
 ## Notes
 
-- The latest tagged release is `v1.0.1`.
-- The current codebase already includes newer untagged performance work: native audio capture and VAD-based silence trimming.
-- If you want docs and binaries to line up perfectly, cut a fresh tag after QA.
+- The latest release line includes native audio capture and VAD-based silence trimming.
+- Installers are built by GitHub Actions when a `v*` tag is pushed.
 
 ---
 

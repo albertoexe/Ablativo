@@ -1,6 +1,6 @@
 [package]
 name = "ablativo-tauri"
-version = "1.0.0"
+version = "1.2.0"
 description = "Ablativo — local voice transcription"
 authors = ["Alberto De Col"]
 edition = "2021"
